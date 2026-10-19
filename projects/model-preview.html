@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IFC Model Preview</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#edf1f4}
+#viewer{position:absolute;inset:0}
+#viewer canvas{display:block;width:100%;height:100%;outline:none}
+.top,.bottom{position:absolute;z-index:3;left:14px;right:14px;display:flex;justify-content:space-between;pointer-events:none;font:9px monospace;letter-spacing:.05em;color:#627184}
+.top{top:14px}.bottom{bottom:14px}
+.tag{background:#f7f8faed;border:1px solid #dfe5ea;padding:8px 10px}
+.message{position:absolute;z-index:4;inset:0;display:grid;place-items:center;padding:20px;text-align:center;pointer-events:none}
+.message div{max-width:330px;background:#f7f8faed;border:1px solid #dfe5ea;padding:20px}
+.message strong{display:block;font:600 14px Arial,sans-serif;color:#1a2533;margin-bottom:8px}
+.message p{font:11px/1.7 Arial,sans-serif;color:#75818d;margin:0}
+.message.hidden{display:none}
+</style>
+<!-- three.js dan web-ifc di-host sendiri di /vendor (tanpa CDN) -->
+<script type="importmap">
+{ "imports": { "three": "../vendor/three.module.min.js" } }
+</script>
+</head>
+<body>
+<div id="viewer"></div>
+<div class="top"><span class="tag" id="modelTitle">THE BREEZE / MODEL VIEW</span><span class="tag">IFC4 · INTERACTIVE</span></div>
+<div class="bottom"><span class="tag">ORBIT / ZOOM / PAN</span><span class="tag">PREVIEW ONLY</span></div>
+<div class="message" id="message"><div><strong id="msgTitle">Loading IFC model…</strong><p id="msgText">The model is being prepared in your browser. The first load may take a few seconds.</p></div></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from '../vendor/OrbitControls.js';
+import * as WebIFC from '../vendor/web-ifc-api.js';
+
+const msg = document.getElementById('message');
+const setMsg = (t, p) => {
+  document.getElementById('msgTitle').textContent = t;
+  document.getElementById('msgText').textContent = p;
+  msg.classList.remove('hidden');
+};
+
+// ---------- Daftar model ----------
+// Pakai: model-preview.html?model=gate   (default: breeze)
+// up: sumbu yang dipakai sebagai "atas" ('y' atau 'z'); bisa ditimpa dengan ?up=z
+const MODELS = {
+  breeze: { file: '../models/the-breeze-rejuvenation.ifc', up: 'y', title: 'THE BREEZE / MODEL VIEW' },
+  gate:   { file: '../models/gate-entrance-jimbaran.ifc',  up: 'y', title: 'GATE ENTRANCE JIMBARAN / MODEL VIEW' }
+};
+const params = new URLSearchParams(location.search);
+const CONFIG = MODELS[params.get('model')] || MODELS.breeze;
+document.getElementById('modelTitle').textContent = CONFIG.title;
+
+try {
+  // ---------- Scene ----------
+  const container = document.getElementById('viewer');
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xedf1f4);
+
+  const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100000);
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  container.appendChild(renderer.domElement);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x8899aa, 1.1));
+  const sun = new THREE.DirectionalLight(0xffffff, 1.3);
+  sun.position.set(1, 2, 1.5);
+  scene.add(sun);
+  const fill = new THREE.DirectionalLight(0xffffff, 0.5);
+  fill.position.set(-1.5, 1, -1);
+  scene.add(fill);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+
+  const resize = () => {
+    const w = container.clientWidth, h = container.clientHeight;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  };
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- web-ifc ----------
+  const ifcApi = new WebIFC.IfcAPI();
+  // Path absolut ke folder yang berisi web-ifc.wasm
+  ifcApi.SetWasmPath(new URL('../vendor/', import.meta.url).href, true);
+  await ifcApi.Init();
+
+  setMsg('Downloading model…', 'Fetching the IFC file.');
+  const modelUrl = new URL(CONFIG.file, import.meta.url).href;
+  const res = await fetch(modelUrl);
+  if (!res.ok) throw new Error('IFC file not found (HTTP ' + res.status + ') at ' + modelUrl);
+  const data = new Uint8Array(await res.arrayBuffer());
+
+  setMsg('Processing geometry…', 'Reading the IFC model in your browser.');
+  await new Promise(r => setTimeout(r, 30)); // beri kesempatan UI menampilkan pesan
+
+  const modelID = ifcApi.OpenModel(data);
+
+  // Gabungkan semua mesh berdasarkan warna -> draw call sedikit, render ringan
+  const buckets = new Map(); // key -> {color, opacity, pos[], nor[], idx[], count}
+  const m4 = new THREE.Matrix4();
+  const normalMat = new THREE.Matrix3();
+  const v = new THREE.Vector3();
+
+  ifcApi.StreamAllMeshes(modelID, (mesh) => {
+    const placed = mesh.geometries;
+    for (let i = 0; i < placed.size(); i++) {
+      const pg = placed.get(i);
+      const geom = ifcApi.GetGeometry(modelID, pg.geometryExpressID);
+      const verts = ifcApi.GetVertexArray(geom.GetVertexData(), geom.GetVertexDataSize());
+      const index = ifcApi.GetIndexArray(geom.GetIndexData(), geom.GetIndexDataSize());
+      const c = pg.color;
+      const key = [c.x, c.y, c.z, c.w].map(n => n.toFixed(3)).join('_');
+      let b = buckets.get(key);
+      if (!b) { b = { c, pos: [], nor: [], idx: [], count: 0 }; buckets.set(key, b); }
+
+      m4.fromArray(pg.flatTransformation);
+      normalMat.getNormalMatrix(m4);
+      const base = b.count;
+      for (let j = 0; j < verts.length; j += 6) {
+        v.set(verts[j], verts[j + 1], verts[j + 2]).applyMatrix4(m4);
+        b.pos.push(v.x, v.y, v.z);
+        v.set(verts[j + 3], verts[j + 4], verts[j + 5]).applyMatrix3(normalMat).normalize();
+        b.nor.push(v.x, v.y, v.z);
+      }
+      for (let j = 0; j < index.length; j++) b.idx.push(index[j] + base);
+      b.count += verts.length / 6;
+      geom.delete();
+    }
+  });
+  ifcApi.CloseModel(modelID);
+
+  const group = new THREE.Group();
+  for (const b of buckets.values()) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(b.pos, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(b.nor, 3));
+    g.setIndex(b.idx);
+    const mat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(b.c.x, b.c.y, b.c.z),
+      opacity: b.c.w, transparent: b.c.w < 1,
+      side: THREE.DoubleSide, roughness: 0.75, metalness: 0.1
+    });
+    group.add(new THREE.Mesh(g, mat));
+  }
+  if (!group.children.length) throw new Error('No geometry found in the IFC file.');
+
+  // Orientasi: default per model (lihat MODELS). Coba ?up=z kalau model tampil berdiri/terbalik.
+  const ORIENTATION = params.get('up') || CONFIG.up;
+  group.rotation.x = ORIENTATION === 'y' ? 0 : -Math.PI / 2;
+  scene.add(group);
+
+  // ---------- Frame model ----------
+  const box = new THREE.Box3().setFromObject(group);
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3());
+  group.position.sub(center);                 // pusatkan model di origin
+  group.position.y += size.y / 2;             // dasar model di y=0
+
+  const radius = Math.max(size.x, size.y, size.z);
+  const grid = new THREE.GridHelper(radius * 3, 30, 0x9aa7b4, 0xc9d2da);
+  scene.add(grid);
+
+  camera.near = radius / 1000;
+  camera.far = radius * 50;
+  camera.position.set(radius * 1.1, radius * 0.8, radius * 1.1);
+  camera.updateProjectionMatrix();
+  controls.target.set(0, size.y / 2, 0);
+  controls.update();
+
+  msg.classList.add('hidden');
+
+  renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+} catch (error) {
+  console.error('IFC viewer failed:', error);
+  setMsg('Could not load model', 'Viewer error: ' + (error && error.message ? error.message : String(error)));
+}
+</script>
+</body>
+</html>
